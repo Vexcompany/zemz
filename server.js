@@ -8,6 +8,8 @@ const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const musicRoutes = require('./routes/musicRoutes');
+app.use('/api', musicRoutes);
 
 // Middleware
 app.use(helmet());
