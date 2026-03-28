@@ -1,9 +1,9 @@
-// controllers/downloadController.js — v3 FINAL
-// Fix: semua jsonDb call dibungkus try-catch agar tidak crash di Vercel
+// controllers/downloadController.js — FINAL
+// Bypass enhancedDownloader sepenuhnya karena aplmate tidak reliable di Vercel
+// Langsung pakai previewUrl dari iTunes — sudah cukup untuk memutar lagu
 
-const enhancedDownloader = require('../services/enhancedDownloader');
-const jsonDb             = require('../services/jsonDatabase');
-const appleDownloader    = require('../services/appleDownloader');
+const jsonDb          = require('../services/jsonDatabase');
+const appleDownloader = require('../services/appleDownloader');
 
 exports.download = async (req, res, next) => {
     try {
@@ -14,14 +14,14 @@ exports.download = async (req, res, next) => {
         }
 
         console.log('[download] url:', url.substring(0, 80));
-        console.log('[download] previewUrl:', previewUrl ? previewUrl.substring(0, 60) : 'none');
+        console.log('[download] previewUrl:', previewUrl ? 'ada' : 'tidak ada');
 
         // ── Prioritas 1: Cache database ──────────────────────────
         if (!forceReupload) {
             try {
                 const cached = await jsonDb.findTrack(url);
                 if (cached?.catbox?.mp3Url) {
-                    console.log('[download] Found in cache:', cached.title);
+                    console.log('[download] Cache hit:', cached.title);
                     try { await jsonDb.updateAccess(url); } catch {}
                     return res.json({
                         status: true,
@@ -37,36 +37,41 @@ exports.download = async (req, res, next) => {
                     });
                 }
             } catch (e) {
-                console.warn('[download] Cache check failed (ok):', e.message);
+                console.warn('[download] Cache skip:', e.message);
             }
         }
 
-        // ── Prioritas 2: iTunes previewUrl — PALING RELIABLE ────
+        // ── Prioritas 2: iTunes previewUrl — LANGSUNG RETURN ────
+        // Ini yang selalu ada karena appleSearch.js sudah include previewUrl
         if (previewUrl && previewUrl.trim()) {
-            console.log('[download] Using iTunes previewUrl');
+            console.log('[download] Using previewUrl');
             return res.json({
                 status: true,
                 source: 'itunes_preview',
                 result: {
-                    url:      previewUrl,
-                    download: { mp3: previewUrl },
+                    url:      previewUrl.trim(),
+                    download: { mp3: previewUrl.trim() },
                     duration: null,
                     image:    null
                 }
             });
         }
 
-        // ── Prioritas 3: Aplmate full song ───────────────────────
+        // ── Prioritas 3: Coba aplmate (sering gagal, tapi dicoba) ─
         console.log('[download] Trying aplmate...');
         try {
-            const result = await enhancedDownloader.processDownload(url, { skipCatbox, forceReupload });
-
-            if (result.status === 'processing') {
-                return res.status(202).json(result);
-            }
-            if (result.status === true && result.result?.download?.mp3) {
-                result.result.url = result.result.download.mp3;
-                return res.json(result);
+            const aplmateResult = await appleDownloader.download(url);
+            if (aplmateResult?.status && aplmateResult.result?.download?.mp3) {
+                const mp3 = aplmateResult.result.download.mp3;
+                return res.json({
+                    status: true,
+                    source: 'aplmate',
+                    result: {
+                        ...aplmateResult.result,
+                        url: mp3,
+                        download: { mp3 }
+                    }
+                });
             }
         } catch (e) {
             console.warn('[download] aplmate failed:', e.message);
@@ -75,11 +80,11 @@ exports.download = async (req, res, next) => {
         // ── Semua gagal ──────────────────────────────────────────
         return res.status(500).json({
             status: false,
-            message: 'Gagal mendapatkan audio. pastikan previewUrl dikirim dari frontend.'
+            message: 'Tidak ada previewUrl dan aplmate gagal. Coba lagu lain.'
         });
 
     } catch (error) {
-        console.error('[download] Unexpected error:', error.message);
+        console.error('[download] Fatal:', error.message);
         next(error);
     }
 };
@@ -90,19 +95,21 @@ exports.getInfo = async (req, res, next) => {
         if (!url) return res.status(400).json({ status: false, message: 'url required' });
         try {
             const cached = await jsonDb.findTrack(url);
-            if (cached) return res.json({ status: true, source: 'database', result: { ...cached, url: cached.catbox?.mp3Url } });
+            if (cached) return res.json({ status: true, source: 'database',
+                result: { ...cached, url: cached.catbox?.mp3Url } });
         } catch {}
         const info = await appleDownloader.download(url);
-        if (info.status) return res.json({ status: true, source: 'aplmate', result: { ...info.result, url: info.result.download?.mp3 } });
-        throw new Error('Gagal mendapatkan info');
-    } catch (error) { next(error); }
+        if (info?.status) return res.json({ status: true, source: 'aplmate',
+            result: { ...info.result, url: info.result.download?.mp3 } });
+        throw new Error('Gagal');
+    } catch (e) { next(e); }
 };
 
 exports.getAllTracks = async (req, res, next) => {
     try {
-        const data = await jsonDb.getAllTracks(parseInt(req.query.page)||1, parseInt(req.query.limit)||50);
-        res.json({ status: true, data });
-    } catch (error) { next(error); }
+        res.json({ status: true, data: await jsonDb.getAllTracks(
+            parseInt(req.query.page)||1, parseInt(req.query.limit)||50) });
+    } catch (e) { next(e); }
 };
 
 exports.searchLocal = async (req, res, next) => {
@@ -111,15 +118,14 @@ exports.searchLocal = async (req, res, next) => {
         if (!q) return res.status(400).json({ status: false, message: 'q required' });
         const tracks = await jsonDb.searchTracks(q);
         res.json({ status: true, query: q, total: tracks.length, data: tracks });
-    } catch (error) { next(error); }
+    } catch (e) { next(e); }
 };
 
 exports.reupload = async (req, res, next) => {
     try {
         const { url } = req.body;
         if (!url) return res.status(400).json({ status: false, message: 'url required' });
-        const result = await enhancedDownloader.processDownload(url, { forceReupload: true });
-        if (result.result?.download) result.result.url = result.result.download.mp3 || null;
-        res.json(result);
-    } catch (error) { next(error); }
+        // Di Vercel tidak bisa reupload yang butuh filesystem, return info saja
+        return res.json({ status: false, message: 'Reupload tidak tersedia di Vercel serverless' });
+    } catch (e) { next(e); }
 };
