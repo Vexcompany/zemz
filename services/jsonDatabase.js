@@ -1,42 +1,30 @@
-const fs = require('fs').promises;
+// services/jsonDatabase.js — FIXED untuk Vercel
+// Masalah: Vercel filesystem READ-ONLY kecuali /tmp
+// Fix: pakai /tmp/zemz-data/ sebagai storage
+
+const fs   = require('fs').promises;
 const path = require('path');
 
-/**
- * JSON DATABASE SERVICE
- * @description Simpan metadata track & URL Catbox ke file JSON
- */
 class JsonDatabase {
     constructor() {
-        this.dbPath = path.join(__dirname, '../data/tracks.json');
-        this.cachePath = path.join(__dirname, '../data/cache.json');
-        this.ensureDirectory();
+        // /tmp adalah satu-satunya folder writable di Vercel serverless
+        const dataDir    = process.env.VERCEL ? '/tmp/zemz-data' : path.join(__dirname, '../data');
+        this.dbPath      = path.join(dataDir, 'tracks.json');
+        this.cachePath   = path.join(dataDir, 'cache.json');
+        this._ready      = this.ensureDirectory();
     }
 
     async ensureDirectory() {
-        const dir = path.dirname(this.dbPath);
         try {
-            await fs.access(dir);
-        } catch {
-            await fs.mkdir(dir, { recursive: true });
+            await fs.mkdir(path.dirname(this.dbPath), { recursive: true });
+        } catch (e) {
+            // Ignore kalau sudah ada
         }
     }
 
-    /**
-     * Inisialisasi database kosong
-     */
-    async init() {
-        try {
-            await fs.access(this.dbPath);
-        } catch {
-            await this.save({ tracks: [], lastUpdated: new Date().toISOString() });
-        }
-    }
-
-    /**
-     * Baca seluruh database
-     */
     async read() {
         try {
+            await this._ready;
             const data = await fs.readFile(this.dbPath, 'utf8');
             return JSON.parse(data);
         } catch {
@@ -44,155 +32,134 @@ class JsonDatabase {
         }
     }
 
-    /**
-     * Simpan ke database
-     */
     async save(data) {
-        await this.ensureDirectory();
-        await fs.writeFile(this.dbPath, JSON.stringify(data, null, 2));
+        try {
+            await this._ready;
+            await fs.writeFile(this.dbPath, JSON.stringify(data, null, 2));
+        } catch (e) {
+            console.warn('[jsonDb] Cannot write file:', e.message);
+            // Di Vercel /tmp mungkin juga terbatas — tidak throw, cukup warn
+        }
     }
 
-    /**
-     * Cari track berdasarkan Apple Music URL atau ID
-     */
     async findTrack(appleMusicUrl) {
-        const db = await this.read();
-        const trackId = this.extractTrackId(appleMusicUrl);
-        
-        return db.tracks.find(track => 
-            track.appleMusicId === trackId || 
-            track.appleMusicUrl === appleMusicUrl
-        );
+        try {
+            const db = await this.read();
+            const trackId = this.extractTrackId(appleMusicUrl);
+            return db.tracks.find(t =>
+                t.appleMusicId === trackId ||
+                t.appleMusicUrl === appleMusicUrl
+            ) || null;
+        } catch { return null; }
     }
 
-    /**
-     * Cari track berdasarkan judul dan artis
-     */
     async findByMetadata(title, artist) {
-        const db = await this.read();
-        const normalizedTitle = this.normalizeString(title);
-        const normalizedArtist = this.normalizeString(artist);
-
-        return db.tracks.find(track => 
-            this.normalizeString(track.title) === normalizedTitle &&
-            this.normalizeString(track.artist) === normalizedArtist
-        );
+        try {
+            const db = await this.read();
+            const nt = this.normalizeString(title);
+            const na = this.normalizeString(artist);
+            return db.tracks.find(t =>
+                this.normalizeString(t.title)  === nt &&
+                this.normalizeString(t.artist) === na
+            ) || null;
+        } catch { return null; }
     }
 
-    /**
-     * Tambah atau update track
-     */
     async saveTrack(trackData) {
-        const db = await this.read();
-        const trackId = this.extractTrackId(trackData.appleMusicUrl);
-        
-        // Cek apakah track sudah ada
-        const existingIndex = db.tracks.findIndex(t => 
-            t.appleMusicId === trackId
-        );
+        try {
+            const db      = await this.read();
+            const trackId = this.extractTrackId(trackData.appleMusicUrl);
+            const idx     = db.tracks.findIndex(t => t.appleMusicId === trackId);
 
-        const trackRecord = {
-            id: trackId || `track_${Date.now()}`,
-            appleMusicId: trackId,
-            appleMusicUrl: trackData.appleMusicUrl,
-            title: trackData.title,
-            artist: trackData.artist,
-            image: trackData.image,
-            duration: trackData.duration,
-            catbox: {
-                mp3Url: trackData.catboxMp3,
-                coverUrl: trackData.catboxCover,
-                uploadedAt: new Date().toISOString()
-            },
-            metadata: {
-                addedAt: new Date().toISOString(),
-                lastAccessed: new Date().toISOString(),
-                downloadCount: 1
+            const record = {
+                id:            trackId || `track_${Date.now()}`,
+                appleMusicId:  trackId,
+                appleMusicUrl: trackData.appleMusicUrl,
+                title:         trackData.title,
+                artist:        trackData.artist,
+                image:         trackData.image,
+                duration:      trackData.duration,
+                catbox: {
+                    mp3Url:    trackData.catboxMp3,
+                    coverUrl:  trackData.catboxCover,
+                    uploadedAt: new Date().toISOString()
+                },
+                metadata: {
+                    addedAt:       new Date().toISOString(),
+                    lastAccessed:  new Date().toISOString(),
+                    downloadCount: 1
+                }
+            };
+
+            if (idx >= 0) {
+                record.metadata.addedAt       = db.tracks[idx].metadata.addedAt;
+                record.metadata.downloadCount = (db.tracks[idx].metadata.downloadCount || 0) + 1;
+                db.tracks[idx] = record;
+            } else {
+                db.tracks.push(record);
             }
-        };
 
-        if (existingIndex >= 0) {
-            // Update existing
-            const existing = db.tracks[existingIndex];
-            trackRecord.metadata.addedAt = existing.metadata.addedAt;
-            trackRecord.metadata.downloadCount = (existing.metadata.downloadCount || 0) + 1;
-            
-            db.tracks[existingIndex] = trackRecord;
-        } else {
-            // Tambah baru
-            db.tracks.push(trackRecord);
-        }
-
-        db.lastUpdated = new Date().toISOString();
-        await this.save(db);
-
-        return trackRecord;
-    }
-
-    /**
-     * Update last accessed
-     */
-    async updateAccess(appleMusicUrl) {
-        const db = await this.read();
-        const trackId = this.extractTrackId(appleMusicUrl);
-        
-        const track = db.tracks.find(t => t.appleMusicId === trackId);
-        if (track) {
-            track.metadata.lastAccessed = new Date().toISOString();
+            db.lastUpdated = new Date().toISOString();
             await this.save(db);
+            return record;
+        } catch (e) {
+            console.warn('[jsonDb] saveTrack failed:', e.message);
+            return trackData;
         }
     }
 
-    /**
-     * Dapatkan semua tracks (dengan pagination)
-     */
-    async getAllTracks(page = 1, limit = 50) {
-        const db = await this.read();
-        const start = (page - 1) * limit;
-        const end = start + limit;
-        
-        return {
-            tracks: db.tracks.slice(start, end),
-            total: db.tracks.length,
-            page,
-            totalPages: Math.ceil(db.tracks.length / limit)
-        };
+    async updateAccess(appleMusicUrl) {
+        try {
+            const db      = await this.read();
+            const trackId = this.extractTrackId(appleMusicUrl);
+            const track   = db.tracks.find(t => t.appleMusicId === trackId);
+            if (track) {
+                track.metadata.lastAccessed = new Date().toISOString();
+                await this.save(db);
+            }
+        } catch { /* silent */ }
     }
 
-    /**
-     * Cari tracks dengan keyword
-     */
+    async getAllTracks(page = 1, limit = 50) {
+        try {
+            const db    = await this.read();
+            const start = (page - 1) * limit;
+            return {
+                tracks:     db.tracks.slice(start, start + limit),
+                total:      db.tracks.length,
+                page,
+                totalPages: Math.ceil(db.tracks.length / limit)
+            };
+        } catch { return { tracks: [], total: 0, page: 1, totalPages: 0 }; }
+    }
+
     async searchTracks(query) {
-        const db = await this.read();
-        const normalizedQuery = this.normalizeString(query);
-        
-        return db.tracks.filter(track => 
-            this.normalizeString(track.title).includes(normalizedQuery) ||
-            this.normalizeString(track.artist).includes(normalizedQuery)
-        );
+        try {
+            const db = await this.read();
+            const nq = this.normalizeString(query);
+            return db.tracks.filter(t =>
+                this.normalizeString(t.title).includes(nq) ||
+                this.normalizeString(t.artist).includes(nq)
+            );
+        } catch { return []; }
     }
 
     extractTrackId(url) {
         if (!url) return null;
-        const match = url.match(/[?&]i=(\d+)/);
-        return match ? match[1] : null;
+        const m = url.match(/[?&]i=(\d+)/);
+        return m ? m[1] : null;
     }
 
     normalizeString(str) {
-        return str.toLowerCase().replace(/[^\w\s]/g, '').trim();
+        return (str || '').toLowerCase().replace(/[^\w\s]/g, '').trim();
     }
 
-    /**
-     * Backup database
-     */
     async backup() {
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const backupPath = path.join(__dirname, `../data/backup/tracks_${timestamp}.json`);
-        
-        const db = await this.read();
+        const ts         = new Date().toISOString().replace(/[:.]/g, '-');
+        const backupPath = path.join(path.dirname(this.dbPath), `backup/tracks_${ts}.json`);
+        const db         = await this.read();
         await fs.mkdir(path.dirname(backupPath), { recursive: true });
         await fs.writeFile(backupPath, JSON.stringify(db, null, 2));
-        
         return backupPath;
     }
 }
