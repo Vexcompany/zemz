@@ -1,3 +1,6 @@
+const corsMiddleware = require('./middleware/cors');
+app.use(corsMiddleware); // ← harus paling atas!
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
