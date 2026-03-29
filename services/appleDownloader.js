@@ -1,156 +1,84 @@
-const axios = require('axios');
-const cheerio = require('cheerio');
+// services/appleDownloader.js — REWRITE pakai nexray API
+// Ganti aplmate (scraping, tidak reliable) → nexray (REST API, reliable)
 
-/**
- * APPLE MUSIC DOWNLOADER SERVICE
- * @creator AgungDevX
- * @description Download lagu dari Apple Music via AplMate
- */
+const axios = require('axios');
+
 class AppleDownloaderService {
+
     constructor() {
-        this.base = "https://aplmate.com";
-        this.headers = {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Origin": this.base,
-            "Referer": this.base + "/"
-        };
+        this.nexrayBase = 'https://api.nexray.web.id/downloader/applemusic';
     }
 
     async download(url) {
         try {
-            // Validasi URL Apple Music
             if (!this.isValidAppleMusicUrl(url)) {
-                throw new Error("URL tidak valid. Harus menggunakan URL Apple Music.");
+                throw new Error('URL tidak valid. Harus menggunakan URL Apple Music.');
             }
 
-            console.log(`[+] Processing: ${url}`);
+            console.log('[nexray] Processing:', url.substring(0, 80));
 
-            // Step 1: Get CSRF & Session
-            const sessionData = await this.getSession();
-            
-            // Step 2: Submit URL ke /action
-            const trackInfo = await this.submitUrl(url, sessionData);
-            
-            // Step 3: Get download links
-            const downloadLinks = await this.getDownloadLinks(trackInfo, sessionData);
+            const response = await axios.get(this.nexrayBase, {
+                params: { url },
+                timeout: 30000,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'application/json'
+                }
+            });
+
+            const data = response.data;
+            console.log('[nexray] Response keys:', Object.keys(data || {}));
+
+            // Normalisasi berbagai kemungkinan format response nexray
+            const mp3Url = data?.result?.url
+                        || data?.result?.download
+                        || data?.result?.audio
+                        || data?.result?.mp3
+                        || data?.download?.url
+                        || data?.download?.mp3
+                        || data?.audio
+                        || data?.url
+                        || data?.mp3
+                        || null;
+
+            const title  = data?.result?.title  || data?.title  || 'Unknown';
+            const artist = data?.result?.artist  || data?.artist || 'Unknown';
+            const image  = data?.result?.image   || data?.result?.thumbnail
+                        || data?.image           || data?.thumbnail || null;
+            const duration = data?.result?.duration || data?.duration || null;
+
+            if (!mp3Url) {
+                console.error('[nexray] Full response:', JSON.stringify(data).substring(0, 300));
+                throw new Error('nexray tidak mengembalikan URL audio');
+            }
 
             return {
                 status: true,
                 result: {
-                    title: trackInfo.title,
-                    artist: trackInfo.artist,
-                    image: trackInfo.image,
-                    duration: trackInfo.duration || null,
-                    download: downloadLinks
+                    title,
+                    artist,
+                    image,
+                    duration,
+                    download: {
+                        mp3:     mp3Url,
+                        cover:   image,
+                        quality: data?.result?.quality || '128kbps'
+                    }
                 }
             };
 
         } catch (err) {
+            // Kalau axios error (4xx/5xx), log response body untuk debug
+            if (err.response) {
+                console.error('[nexray] HTTP', err.response.status, JSON.stringify(err.response.data).substring(0, 200));
+            }
             throw new Error(`Download failed: ${err.message}`);
         }
     }
 
     isValidAppleMusicUrl(url) {
-        return url.includes('music.apple.com') && (url.includes('/album/') || url.includes('/song/'));
-    }
-
-    async getSession() {
-        try {
-            const response = await axios.get(this.base, { 
-                headers: this.headers,
-                timeout: 10000 
-            });
-
-            const $ = cheerio.load(response.data);
-            const csrfInput = $("input[type='hidden']").filter((i, el) => $(el).attr("name")?.startsWith("_"));
-            const session = response.headers["set-cookie"]?.[0]?.split(';')[0] || "";
-
-            return {
-                csrfName: csrfInput.attr("name"),
-                csrfValue: csrfInput.attr("value"),
-                session: session
-            };
-        } catch (err) {
-            throw new Error("Gagal mendapatkan session");
-        }
-    }
-
-    async submitUrl(url, sessionData) {
-        const boundary = "----WebKitFormBoundary" + Math.random().toString(36).substring(2);
-        
-        let formData = `--${boundary}\r\n`;
-        formData += `Content-Disposition: form-data; name="url"\r\n\r\n${url}\r\n`;
-        formData += `--${boundary}\r\n`;
-        formData += `Content-Disposition: form-data; name="${sessionData.csrfName}"\r\n\r\n${sessionData.csrfValue}\r\n`;
-        formData += `--${boundary}--\r\n`;
-
-        try {
-            const response = await axios.post(`${this.base}/action`, formData, {
-                headers: { 
-                    ...this.headers, 
-                    "Content-Type": `multipart/form-data; boundary=${boundary}`, 
-                    "Cookie": sessionData.session 
-                },
-                timeout: 15000
-            });
-
-            const $ = cheerio.load(response.data.html || response.data);
-            
-            return {
-                data: $("input[name='data']").attr("value"),
-                base: $("input[name='base']").attr("value"),
-                token: $("input[name='token']").attr("value"),
-                title: $(".aplmate-downloader-middle h3 div").text().trim() || $(".title").text().trim(),
-                artist: $(".aplmate-downloader-middle p span").text().trim() || $(".artist").text().trim(),
-                image: $(".aplmate-downloader-left img").attr("src") || $("img.cover").attr("src"),
-                duration: $(".duration").text().trim() || null
-            };
-        } catch (err) {
-            throw new Error("Gagal submit URL ke server");
-        }
-    }
-
-    async getDownloadLinks(trackInfo, sessionData) {
-        if (!trackInfo.data) {
-            throw new Error("Data track tidak ditemukan");
-        }
-
-        const boundary = "----WebKitFormBoundary" + Math.random().toString(36).substring(2);
-        
-        let formData = `--${boundary}\r\n`;
-        formData += `Content-Disposition: form-data; name="data"\r\n\r\n${trackInfo.data}\r\n`;
-        formData += `--${boundary}\r\n`;
-        formData += `Content-Disposition: form-data; name="base"\r\n\r\n${trackInfo.base}\r\n`;
-        formData += `--${boundary}\r\n`;
-        formData += `Content-Disposition: form-data; name="token"\r\n\r\n${trackInfo.token}\r\n`;
-        formData += `--${boundary}--\r\n`;
-
-        try {
-            const response = await axios.post(`${this.base}/action/track`, formData, {
-                headers: { 
-                    ...this.headers, 
-                    "Content-Type": `multipart/form-data; boundary=${boundary}`, 
-                    "Cookie": sessionData.session 
-                },
-                timeout: 15000
-            });
-
-            const $ = cheerio.load(response.data.data || response.data);
-            
-            const mp3Link = $("a:contains('Download Mp3'), a:contains('MP3'), a.download-mp3").attr("href");
-            const coverLink = $("a:contains('Download Cover'), a:contains('Cover'), a.download-cover").attr("href");
-
-            return {
-                mp3: mp3Link ? (mp3Link.startsWith('http') ? mp3Link : this.base + mp3Link) : null,
-                cover: coverLink ? (coverLink.startsWith('http') ? coverLink : this.base + coverLink) : null,
-                quality: "128kbps" // Default quality dari AplMate
-            };
-        } catch (err) {
-            throw new Error("Gagal mendapatkan link download");
-        }
+        return url.includes('music.apple.com') &&
+               (url.includes('/album/') || url.includes('/song/'));
     }
 }
 
